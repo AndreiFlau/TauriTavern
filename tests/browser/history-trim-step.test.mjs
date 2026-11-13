@@ -21,14 +21,24 @@ test('history trim step', async (context) => {
 
         const EXAMPLE_DIALOGUES = [[{ content: 'example a' }], [{ content: 'example b' }], [{ content: 'example c' }]];
 
-        async function assemble(chatLength, historyTrimStep) {
+        // A step left out stands for settings saved before the option existed; a note depth injects a one-token note.
+        async function assemble(chatLength, historyTrimStep, noteDepth) {
             const settings = openai.normalizeChatCompletionSettingsForPromptAssembly({
                 chat_completion_source: 'moonshot', moonshot_model: 'kimi-k3',
-                openai_max_context: 96, openai_max_tokens: 16, history_trim_step: historyTrimStep,
+                openai_max_context: 96, openai_max_tokens: 16,
+                ...(historyTrimStep === undefined ? {} : { history_trim_step: historyTrimStep }),
             });
+            const order = ['main', 'dialogueExamples', 'chatHistory'];
+            if (noteDepth !== undefined) {
+                settings.prompts.push({
+                    identifier: 'note', name: 'Note', system_prompt: false, role: 'system', content: 'note',
+                    injection_position: 1, injection_depth: noteDepth, injection_order: 100,
+                });
+                order.push('note');
+            }
             settings.prompt_order = [{
                 character_id: 100001,
-                order: ['main', 'dialogueExamples', 'chatHistory'].map(identifier => ({ identifier, enabled: true })),
+                order: order.map(identifier => ({ identifier, enabled: true })),
             }];
             const chat = Array.from({ length: chatLength }, (_, number) => ({
                 role: number % 2 ? 'assistant' : 'user', content: `message ${number}`, sourceCount: 1,
@@ -76,6 +86,25 @@ test('history trim step', async (context) => {
         await context.test('the space a step frees is not handed to dialogue examples', async () => {
             for (const length of CHAT_LENGTHS) {
                 assert.deepEqual((await assemble(length, 10)).examples, (await assemble(length, 0)).examples);
+            }
+        });
+
+        await context.test('settings without a saved step trim in steps of 20', async () => {
+            for (const length of CHAT_LENGTHS) {
+                assert.deepEqual((await assemble(length)).history, (await assemble(length, 20)).history);
+            }
+        });
+
+        await context.test('a note injected where the budget runs out does not empty the history', async () => {
+            const length = 230;
+            const fits = (await assemble(length, 0)).history.length;
+            for (let depth = fits - 3; depth <= fits + 1; depth += 1) {
+                const natural = (await assemble(length, 0, depth)).history;
+                const { history } = await assemble(length, 20, depth);
+                assert.ok(history.length > 0);
+                assert.equal(history.at(-1), length - 1);
+                assert.deepEqual(history, Array.from({ length: history.length }, (_, offset) => history[0] + offset));
+                assert.ok(history[0] % 20 === 0 || history[0] === natural[0]);
             }
         });
 
