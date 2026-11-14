@@ -11,7 +11,10 @@ test('history trim step', async (context) => {
         await startHost();
         await load('script.js');
         const openai = getModule('scripts/openai.js').namespace;
+        const { power_user } = getModule('scripts/power-user.js').namespace;
         const { macros, initRegisterMacros } = getModule('scripts/macros/macro-system.js').namespace;
+        const { createMacroContextFromSnapshot, updateFrozenMacroContext } = await import(
+            new URL('../../src/scripts/tauritavern/agent/frozen-run-input-snapshot.js', import.meta.url).href);
         initRegisterMacros();
         const ajax = window.jQuery.ajax;
         // 3 per message: the counter subtracts 2, so each message costs one token.
@@ -21,13 +24,31 @@ test('history trim step', async (context) => {
 
         const EXAMPLE_DIALOGUES = [[{ content: 'example a' }], [{ content: 'example b' }], [{ content: 'example c' }]];
 
-        // A step left out stands for settings saved before the option existed; a note depth injects a one-token note;
-        // empty numbers are chat messages left empty, which are never sent.
-        async function assemble(chatLength, historyTrimStep, noteDepth, emptyNumbers = []) {
+        // Captures the generation context with the step set in User Settings; left out, the saved default.
+        function captureWithStep(historyTrimStep) {
+            const saved = power_user.history_trim_step;
+            if (historyTrimStep !== undefined) {
+                power_user.history_trim_step = historyTrimStep;
+            }
+            try {
+                return macros.captureContext();
+            } finally {
+                power_user.history_trim_step = saved;
+            }
+        }
+
+        // The context of an Agent Run saved before History Trim Step existed.
+        function rebuildRunSavedBeforeTheStep() {
+            const snapshot = updateFrozenMacroContext({}, macros.captureContext());
+            delete snapshot.macroContext.settings.history_trim_step;
+            return createMacroContextFromSnapshot(snapshot, { extensionPrompts: {} });
+        }
+
+        // A note depth injects a one-token note; empty numbers are chat messages left empty, which are never sent.
+        async function assemble(chatLength, historyTrimStep, noteDepth, emptyNumbers = [], macroContext = captureWithStep(historyTrimStep)) {
             const settings = openai.normalizeChatCompletionSettingsForPromptAssembly({
                 chat_completion_source: 'moonshot', moonshot_model: 'kimi-k3',
                 openai_max_context: 96, openai_max_tokens: 16,
-                ...(historyTrimStep === undefined ? {} : { history_trim_step: historyTrimStep }),
             });
             const order = ['main', 'dialogueExamples', 'chatHistory'];
             if (noteDepth !== undefined) {
@@ -45,7 +66,7 @@ test('history trim step', async (context) => {
                 role: number % 2 ? 'assistant' : 'user', content: emptyNumbers.includes(number) ? '' : `message ${number}`, sourceCount: 1,
             }));
             const { messages } = await openai.assembleOpenAIChatCompletionPrompt({
-                settings, macroContext: macros.captureContext(), agentMode: false, generationType: 'normal',
+                settings, macroContext, agentMode: false, generationType: 'normal',
                 promptInputs: { messages: chat.reverse(), messageExamples: EXAMPLE_DIALOGUES, extensionPrompts: {} },
             });
             // Copied into this realm: the runtime's arrays have another Array prototype, which strict deepEqual rejects.
@@ -90,9 +111,16 @@ test('history trim step', async (context) => {
             }
         });
 
-        await context.test('settings without a saved step trim in steps of 20', async () => {
+        await context.test('User Settings without a saved step trim in steps of 20', async () => {
             for (const length of CHAT_LENGTHS) {
                 assert.deepEqual((await assemble(length)).history, (await assemble(length, 20)).history);
+            }
+        });
+
+        await context.test('an Agent Run saved before the step existed is rebuilt trimmed one message at a time', async () => {
+            for (const length of CHAT_LENGTHS) {
+                const { history } = await assemble(length, undefined, undefined, [], rebuildRunSavedBeforeTheStep());
+                assert.deepEqual(history, (await assemble(length, 0)).history);
             }
         });
 
